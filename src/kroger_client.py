@@ -1,15 +1,23 @@
 import requests
 import base64
-from config import KROGER_CLIENT_ID, KROGER_CLIENT_SECRET, KROGER_BASE_URL
+from config import KROGER_BASE_URL
+from src.secure_credentials import SecureCredentialError, load_kroger_credentials
+
+class KrogerAuthenticationError(RuntimeError):
+    pass
+
 
 class KrogerAPI:
     def __init__(self):
         self.access_token = None
 
     def authenticate_client(self, scope: str = "product.compact"):
+        credentials = load_kroger_credentials()
+        if credentials is None:
+            raise SecureCredentialError("Kroger credentials are not configured. Add them in Settings.")
+        client_id, client_secret = credentials
         auth_url = f"{KROGER_BASE_URL}/connect/oauth2/token"
-        credentials = f"{KROGER_CLIENT_ID}:{KROGER_CLIENT_SECRET}"
-        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        encoded_credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
 
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -18,6 +26,10 @@ class KrogerAPI:
         data = {"grant_type": "client_credentials", "scope": scope}
 
         response = requests.post(auth_url, headers=headers, data=data)
+        if response.status_code in (400, 401, 403):
+            raise KrogerAuthenticationError(
+                "Kroger rejected the saved client ID or secret. Check them in Settings."
+            )
         response.raise_for_status()
         self.access_token = response.json().get("access_token")
         return self.access_token

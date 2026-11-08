@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import MealPlan from "./MealPlan.jsx";
+import { SCALE_OPTIONS, scaleAmount, scaleServings } from "./scaling.js";
 import { ExternalLink, LoaderCircle, MapPin, Plus, Search, ShoppingBasket, ShoppingCart, Trash2, X } from "lucide-react";
 
 const STARTER_INGREDIENTS = [
@@ -7,6 +9,32 @@ const STARTER_INGREDIENTS = [
   { name: "boneless chicken breast", amount: "" },
   { name: "rolled oats", amount: "" },
 ];
+
+const FUTURE_ENHANCEMENTS = [
+  {
+    title: "Sales-informed recipe suggestions",
+    description: "Recommend recipes to search for based on current deals at your selected store.",
+  },
+  {
+    title: "Android app",
+    description: "Plan meals and manage shopping lists from an Android device.",
+  },
+  {
+    title: "iOS app",
+    description: "Plan meals and manage shopping lists from an iPhone or iPad.",
+  },
+  {
+    title: "Aldi comparison feature",
+    description: "Compare prices for your shopping list at Aldi and Kroger stores.",
+  }
+];
+
+const RECIPE_SOURCE_NAMES = {
+  themealdb: "TheMealDB",
+  budgetbytes: "Budget Bytes",
+  allrecipes: "Allrecipes",
+  pioneerwoman: "The Pioneer Woman",
+};
 
 function formatPrice(price) {
   if (price === null || price === undefined || price === "") return "Price unavailable";
@@ -23,7 +51,7 @@ export default function App() {
       if (Array.isArray(savedIngredients)) {
         return savedIngredients.map((ingredient) => typeof ingredient === "string"
           ? { name: ingredient, amount: "" }
-          : { name: ingredient.name || "", amount: ingredient.amount || "" })
+          : { name: ingredient.name || "", amount: ingredient.amount || "", ...(ingredient.restock ? { restock: true } : {}) })
           .filter((ingredient) => ingredient.name);
       }
     } catch {
@@ -32,6 +60,14 @@ export default function App() {
     return STARTER_INGREDIENTS;
   });
   const [newIngredient, setNewIngredient] = useState("");
+  const [skippedSeasonings, setSkippedSeasonings] = useState(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem("skipped-seasonings"));
+      return Array.isArray(saved) ? saved.filter((item) => item && item.name) : [];
+    } catch {
+      return [];
+    }
+  });
   const [selectedStore, setSelectedStore] = useState(() => {
     try {
       const savedStore = JSON.parse(window.localStorage.getItem("my-store"));
@@ -52,10 +88,19 @@ export default function App() {
   const [organicMeatOnly, setOrganicMeatOnly] = useState(() => window.localStorage.getItem("organic-meat-only") === "true");
   const [organicVegetablesOnly, setOrganicVegetablesOnly] = useState(() => window.localStorage.getItem("organic-vegetables-only") === "true");
   const [nonGmoOnly, setNonGmoOnly] = useState(() => window.localStorage.getItem("non-gmo-only") === "true");
+  const [preferBlockCheese, setPreferBlockCheese] = useState(() => window.localStorage.getItem("prefer-block-cheese") === "true");
   const [activeTab, setActiveTab] = useState("shopping");
   const [savedRecipes, setSavedRecipes] = useState([]);
   const [isLoadingSavedRecipes, setIsLoadingSavedRecipes] = useState(false);
   const [savedRecipesError, setSavedRecipesError] = useState("");
+  const [refreshingRecipeId, setRefreshingRecipeId] = useState(null);
+  const [recipeScales, setRecipeScales] = useState({});
+  const [krogerConfigured, setKrogerConfigured] = useState(null);
+  const [krogerClientId, setKrogerClientId] = useState("");
+  const [krogerClientSecret, setKrogerClientSecret] = useState("");
+  const [isSavingKrogerSettings, setIsSavingKrogerSettings] = useState(false);
+  const [krogerSettingsError, setKrogerSettingsError] = useState("");
+  const [krogerSettingsNotice, setKrogerSettingsNotice] = useState("");
   const [mealIdeas, setMealIdeas] = useState(() => {
     try {
       const savedMeals = JSON.parse(window.localStorage.getItem("meal-list"));
@@ -68,12 +113,14 @@ export default function App() {
     return [];
   });
   const [newMeal, setNewMeal] = useState("");
-  const [recipeSources, setRecipeSources] = useState(["themealdb", "budgetbytes"]);
+  const [recipeSources, setRecipeSources] = useState(["themealdb", "budgetbytes", "allrecipes", "pioneerwoman"]);
   const [recipeResults, setRecipeResults] = useState(null);
   const [isCheckingRecipes, setIsCheckingRecipes] = useState(false);
   const [recipeError, setRecipeError] = useState("");
+  const [recipeNotice, setRecipeNotice] = useState("");
   const [mealError, setMealError] = useState("");
   const [importingRecipe, setImportingRecipe] = useState("");
+  const [skipPantrySeasonings, setSkipPantrySeasonings] = useState(() => window.localStorage.getItem("skip-pantry-seasonings") !== "false");
 
   useEffect(() => {
     window.localStorage.setItem("my-store", JSON.stringify(selectedStore));
@@ -96,7 +143,15 @@ export default function App() {
   }, [nonGmoOnly]);
 
   useEffect(() => {
-    if (activeTab !== "recipes") return undefined;
+    window.localStorage.setItem("prefer-block-cheese", String(preferBlockCheese));
+  }, [preferBlockCheese]);
+
+  useEffect(() => {
+    window.localStorage.setItem("skip-pantry-seasonings", String(skipPantrySeasonings));
+  }, [skipPantrySeasonings]);
+
+  useEffect(() => {
+    if (activeTab !== "recipes" && activeTab !== "plan") return undefined;
     let isCurrent = true;
     setIsLoadingSavedRecipes(true);
     setSavedRecipesError("");
@@ -125,6 +180,29 @@ export default function App() {
     window.localStorage.setItem("shopping-ingredients", JSON.stringify(ingredients));
   }, [ingredients]);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("skipped-seasonings", JSON.stringify(skippedSeasonings));
+    } catch {
+      // Storage unavailable; the list still works for this session.
+    }
+  }, [skippedSeasonings]);
+
+  useEffect(() => {
+    if (activeTab !== "settings") return undefined;
+    let isCurrent = true;
+    fetch("/api/settings/kroger")
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Credential status could not be loaded.");
+        if (isCurrent) setKrogerConfigured(data.configured);
+      })
+      .catch((requestError) => {
+        if (isCurrent) setKrogerSettingsError(requestError.message || "Could not reach secure settings.");
+      });
+    return () => { isCurrent = false; };
+  }, [activeTab]);
+
   function addIngredient(event) {
     event.preventDefault();
     const value = newIngredient.trim();
@@ -139,8 +217,20 @@ export default function App() {
     setResults(null);
   }
 
+  function addSkippedSeasoning(indexToAdd) {
+    if (ingredients.length >= 30) {
+      setError("The shopping list is full (30 items). Remove something first.");
+      return;
+    }
+    const seasoning = skippedSeasonings[indexToAdd];
+    setIngredients((current) => [...current, { name: seasoning.name, amount: seasoning.amount || "", restock: true }]);
+    setSkippedSeasonings((current) => current.filter((_, index) => index !== indexToAdd));
+    setResults(null);
+  }
+
   function clearIngredients() {
     setIngredients([]);
+    setSkippedSeasonings([]);
     setResults(null);
     setError("");
   }
@@ -204,6 +294,47 @@ export default function App() {
     setResults(null);
   }
 
+  function searchFilters() {
+    return {
+      store_id: selectedStore.id,
+      kroger_brands_only: krogerBrandsOnly,
+      organic_meat_only: organicMeatOnly,
+      organic_vegetables_only: organicVegetablesOnly,
+      non_gmo_only: nonGmoOnly,
+      prefer_block_cheese: preferBlockCheese,
+      skip_pantry_seasonings: skipPantrySeasonings,
+    };
+  }
+
+  async function restockSkippedResult(index) {
+    const result = results[index];
+    let marked = false;
+    setIngredients((current) => current.map((ingredient) => {
+      if (marked || ingredient.name !== result.name || (ingredient.amount || "") !== (result.amount || "")) return ingredient;
+      marked = true;
+      return { ...ingredient, restock: true };
+    }));
+    updateResult(index, { restockLoading: true, restockError: "" });
+    try {
+      const response = await fetch("/api/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...searchFilters(),
+          ingredients: [{ name: result.name, amount: result.amount || "", restock: true }],
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Search could not be completed.");
+      updateResult(index, { ...data.results[0], pantry_skipped: false, restockLoading: false });
+    } catch (requestError) {
+      updateResult(index, {
+        restockLoading: false,
+        restockError: requestError.message || "Could not reach the product search service.",
+      });
+    }
+  }
+
   async function findMatches(event) {
     event.preventDefault();
     setError("");
@@ -214,14 +345,7 @@ export default function App() {
       const response = await fetch("/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ingredients,
-          store_id: selectedStore.id,
-          kroger_brands_only: krogerBrandsOnly,
-          organic_meat_only: organicMeatOnly,
-          organic_vegetables_only: organicVegetablesOnly,
-          non_gmo_only: nonGmoOnly,
-        }),
+        body: JSON.stringify({ ...searchFilters(), ingredients }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Search could not be completed.");
@@ -231,6 +355,45 @@ export default function App() {
     } finally {
       setIsLoading(false);
     }
+  }
+
+  function updateResult(indexToUpdate, changes) {
+    setResults((current) => current && current.map((result, index) => (
+      index === indexToUpdate ? { ...result, ...changes } : result
+    )));
+  }
+
+  async function findAlternatives(index) {
+    const result = results[index];
+    updateResult(index, { alternativesLoading: true, alternativesError: "", alternatives: null });
+    try {
+      const response = await fetch("/api/search/alternatives", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ingredient_name: result.name,
+          amount: result.amount || "",
+          store_id: selectedStore.id,
+          kroger_brands_only: krogerBrandsOnly,
+          organic_meat_only: organicMeatOnly,
+          organic_vegetables_only: organicVegetablesOnly,
+          non_gmo_only: nonGmoOnly,
+          prefer_block_cheese: preferBlockCheese,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Alternative search could not be completed.");
+      updateResult(index, { alternativesLoading: false, alternatives: data.alternatives });
+    } catch (requestError) {
+      updateResult(index, {
+        alternativesLoading: false,
+        alternativesError: requestError.message || "Could not reach the product search service.",
+      });
+    }
+  }
+
+  function chooseAlternative(index, alternative) {
+    updateResult(index, { product: alternative, substitutedFrom: alternative.search_term, alternatives: null });
   }
 
   async function checkRecipes(event) {
@@ -258,6 +421,7 @@ export default function App() {
   async function importRecipe(source, recipe) {
     const importKey = `${source.source}-${recipe.id || recipe.url}`;
     setRecipeError("");
+    setRecipeNotice("");
     setImportingRecipe(importKey);
 
     try {
@@ -267,23 +431,44 @@ export default function App() {
         body: JSON.stringify({
           source: source.source,
           recipe_id: source.source === "themealdb" ? recipe.id : recipe.url,
+          skip_pantry_seasonings: skipPantrySeasonings,
         }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Recipe ingredients could not be imported.");
-      if (ingredients.length + data.ingredients.length > 30) {
-        throw new Error("The shopping list supports up to 30 ingredients. Remove some items before importing this recipe.");
+      const shoppingIngredients = data.shopping_ingredients || data.ingredients;
+      if (shoppingIngredients.length > 30) {
+        throw new Error("This recipe has more than 30 shopping items and cannot fit on the list.");
       }
-      setIngredients((current) => [...current, ...data.ingredients]);
+      setIngredients(shoppingIngredients);
+      setSkippedSeasonings(data.excluded_ingredients || []);
       setSavedRecipes((current) => [
         data.saved_recipe,
         ...current.filter((savedRecipe) => savedRecipe.id !== data.saved_recipe.id),
       ]);
+      setRecipeNotice(data.excluded_seasonings?.length
+        ? `Shopping list replaced with ${shoppingIngredients.length} items; skipped pantry seasonings: ${data.excluded_seasonings.join(", ")} (add any you're out of from the shopping list). Full recipe saved for cooking.`
+        : `Shopping list replaced with ${data.title}; full recipe saved for cooking.`);
       setResults(null);
     } catch (requestError) {
       setRecipeError(requestError.message || "Could not import recipe ingredients.");
     } finally {
       setImportingRecipe("");
+    }
+  }
+
+  async function refreshSavedRecipe(recipeId) {
+    setSavedRecipesError("");
+    setRefreshingRecipeId(recipeId);
+    try {
+      const response = await fetch(`/api/recipes/saved/${recipeId}/refresh`, { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Recipe could not be refreshed.");
+      setSavedRecipes((current) => current.map((recipe) => (recipe.id === recipeId ? data.saved_recipe : recipe)));
+    } catch (requestError) {
+      setSavedRecipesError(requestError.message || "Could not reach the recipe source.");
+    } finally {
+      setRefreshingRecipeId(null);
     }
   }
 
@@ -296,6 +481,49 @@ export default function App() {
       setSavedRecipes((current) => current.filter((recipe) => recipe.id !== recipeId));
     } catch (requestError) {
       setSavedRecipesError(requestError.message || "Could not update the recipe library.");
+    }
+  }
+
+  async function saveKrogerSettings(event) {
+    event.preventDefault();
+    setKrogerSettingsError("");
+    setKrogerSettingsNotice("");
+    setIsSavingKrogerSettings(true);
+    try {
+      const response = await fetch("/api/settings/kroger", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: krogerClientId.trim(), client_secret: krogerClientSecret }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Credentials could not be saved.");
+      setKrogerConfigured(data.configured);
+      setKrogerClientId("");
+      setKrogerClientSecret("");
+      setKrogerSettingsNotice("Credentials encrypted and saved in this device's credential vault.");
+    } catch (requestError) {
+      setKrogerSettingsError(requestError.message || "Could not save credentials securely.");
+    } finally {
+      setIsSavingKrogerSettings(false);
+    }
+  }
+
+  async function clearKrogerSettings() {
+    setKrogerSettingsError("");
+    setKrogerSettingsNotice("");
+    setIsSavingKrogerSettings(true);
+    try {
+      const response = await fetch("/api/settings/kroger", { method: "DELETE" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Credentials could not be cleared.");
+      setKrogerConfigured(data.configured);
+      setKrogerClientId("");
+      setKrogerClientSecret("");
+      setKrogerSettingsNotice("Saved Kroger credentials were cleared.");
+    } catch (requestError) {
+      setKrogerSettingsError(requestError.message || "Could not clear saved credentials.");
+    } finally {
+      setIsSavingKrogerSettings(false);
     }
   }
 
@@ -349,10 +577,47 @@ export default function App() {
           >
             Saved recipes <span>{String(savedRecipes.length).padStart(2, "0")}</span>
           </button>
+          <button
+            id="plan-tab"
+            className={activeTab === "plan" ? "view-tab active" : "view-tab"}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "plan"}
+            aria-controls="plan-view"
+            onClick={() => setActiveTab("plan")}
+          >
+            Meal plan
+          </button>
+          <button
+            id="enhancements-tab"
+            className={activeTab === "enhancements" ? "view-tab active" : "view-tab"}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "enhancements"}
+            aria-controls="enhancements-view"
+            onClick={() => setActiveTab("enhancements")}
+          >
+            Enhancements <span>{String(FUTURE_ENHANCEMENTS.length).padStart(2, "0")}</span>
+          </button>
+          <button
+            id="settings-tab"
+            className={activeTab === "settings" ? "view-tab active" : "view-tab"}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "settings"}
+            aria-controls="settings-view"
+            onClick={() => {
+              setKrogerSettingsError("");
+              setKrogerSettingsNotice("");
+              setActiveTab("settings");
+            }}
+          >
+            Settings
+          </button>
         </nav>
 
         {activeTab === "shopping" ? (
-          <>
+          <div id="shopping-view" role="tabpanel" aria-labelledby="shopping-tab">
         <div className="workspace-grid">
           <section className="list-panel" aria-labelledby="list-title">
             <div className="panel-heading">
@@ -450,6 +715,7 @@ export default function App() {
                     <span className="ingredient-name">
                       {ingredient.amount && <span className="ingredient-amount">{ingredient.amount}</span>}
                       {ingredient.name}
+                      {ingredient.restock && <span className="restock-badge" title="Pantry seasoning you're out of; it will be searched">restock</span>}
                     </span>
                     <button
                       className="icon-button remove-button"
@@ -464,6 +730,22 @@ export default function App() {
                 ))}
               </ul>
             ) : <p className="ingredient-empty">Your shopping list is empty.</p>}
+
+            {skippedSeasonings.length > 0 && (
+              <div className="skipped-seasonings">
+                <p>Skipped pantry seasonings. Out of one? Add it to the list.</p>
+                <ul>
+                  {skippedSeasonings.map((seasoning, index) => (
+                    <li key={`${seasoning.name}-${index}`}>
+                      <button type="button" onClick={() => addSkippedSeasoning(index)} title={`Add ${seasoning.name} to the shopping list`}>
+                        <Plus size={13} />
+                        <span>{[seasoning.amount, seasoning.name].filter(Boolean).join(" ")}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             <form className="search-form" onSubmit={findMatches}>
               <label className="brand-toggle">
@@ -510,6 +792,28 @@ export default function App() {
                 />
                 <span>Non-GMO claim only</span>
               </label>
+              <label className="brand-toggle">
+                <input
+                  type="checkbox"
+                  checked={preferBlockCheese}
+                  onChange={(event) => {
+                    setPreferBlockCheese(event.target.checked);
+                    setResults(null);
+                  }}
+                />
+                <span>Block cheese instead of shredded</span>
+              </label>
+              <label className="brand-toggle">
+                <input
+                  type="checkbox"
+                  checked={skipPantrySeasonings}
+                  onChange={(event) => {
+                    setSkipPantrySeasonings(event.target.checked);
+                    setResults(null);
+                  }}
+                />
+                <span>Skip common pantry seasonings</span>
+              </label>
               <button className="search-button" type="submit" disabled={isLoading || ingredients.length === 0 || ingredients.length > 30 || !selectedStore.id}>
                 {isLoading ? <LoaderCircle className="spin" size={18} /> : <Search size={18} />}
                 <span>{isLoading ? "Searching" : "Find matches"}</span>
@@ -536,7 +840,7 @@ export default function App() {
             ) : results ? (
               <div className="results-list">
                 {results.map((result, index) => (
-                  <article className={`result-row ${result.product ? "" : "no-match"}`} key={`${result.ingredient}-${index}`}>
+                  <article className={`result-row ${result.product ? "" : result.pantry_skipped ? "pantry-skipped" : "no-match"}`} key={`${result.ingredient}-${index}`}>
                     <span className="result-index">{String(index + 1).padStart(2, "0")}</span>
                     <div className="result-copy">
                       <p className="result-ingredient">{result.ingredient}</p>
@@ -552,7 +856,24 @@ export default function App() {
                             ]
                               .filter(Boolean).join(" · ") || " "}
                           </p>
+                          {result.substitutedFrom && (
+                            <p className="alternative-note">Alternative via “{result.substitutedFrom}”</p>
+                          )}
                         </>
+                      ) : result.pantry_skipped ? (
+                        <div className="pantry-skip">
+                          <p className="not-found">Pantry seasoning — skipped</p>
+                          <button
+                            type="button"
+                            className="alternative-trigger"
+                            disabled={result.restockLoading}
+                            onClick={() => restockSkippedResult(index)}
+                          >
+                            {result.restockLoading ? <LoaderCircle className="spin" size={14} /> : <Plus size={14} />}
+                            <span>{result.restockLoading ? "Searching" : "I'm out — find it"}</span>
+                          </button>
+                          {result.restockError && <p className="alternative-error" role="alert">{result.restockError}</p>}
+                        </div>
                       ) : <p className="not-found">
                         {result.non_gmo_only
                           ? "No explicit non-GMO claim found"
@@ -560,6 +881,41 @@ export default function App() {
                           ? `No organic ${result.organic_filter} match found`
                           : krogerBrandsOnly ? "No Kroger-brand match found" : "No product match found"}
                       </p>}
+                      {!result.product && !result.pantry_skipped && result.name && (
+                        <div className="alternatives">
+                          {result.alternatives ? (
+                            result.alternatives.length ? (
+                              <ul className="alternative-list">
+                                {result.alternatives.map((alternative) => (
+                                  <li key={alternative.upc || alternative.description}>
+                                    <div>
+                                      <span className="alternative-name">{alternative.description}</span>
+                                      <span className="alternative-meta">
+                                        {[alternative.brand, alternative.size, formatPrice(alternative.estimated_cost ?? alternative.price)]
+                                          .filter(Boolean).join(" · ")}
+                                      </span>
+                                    </div>
+                                    <button type="button" className="alternative-use" onClick={() => chooseAlternative(index, alternative)}>
+                                      Use
+                                    </button>
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : <p className="alternative-empty">No alternatives match your current filters.</p>
+                          ) : (
+                            <button
+                              type="button"
+                              className="alternative-trigger"
+                              disabled={result.alternativesLoading}
+                              onClick={() => findAlternatives(index)}
+                            >
+                              {result.alternativesLoading ? <LoaderCircle className="spin" size={14} /> : <Search size={14} />}
+                              <span>{result.alternativesLoading ? "Searching alternatives" : "Find alternatives"}</span>
+                            </button>
+                          )}
+                          {result.alternativesError && <p className="alternative-error" role="alert">{result.alternativesError}</p>}
+                        </div>
+                      )}
                     </div>
                     <div className="price-cell">
                       <span>EST. COST</span>
@@ -653,12 +1009,21 @@ export default function App() {
                   <input type="checkbox" checked={recipeSources.includes("budgetbytes")} onChange={() => toggleRecipeSource("budgetbytes")} />
                   <span>Budget Bytes</span>
                 </label>
+                <label>
+                  <input type="checkbox" checked={recipeSources.includes("allrecipes")} onChange={() => toggleRecipeSource("allrecipes")} />
+                  <span>Allrecipes</span>
+                </label>
+                <label>
+                  <input type="checkbox" checked={recipeSources.includes("pioneerwoman")} onChange={() => toggleRecipeSource("pioneerwoman")} />
+                  <span>The Pioneer Woman</span>
+                </label>
               </fieldset>
               <button className="recipe-search-button" type="button" onClick={checkRecipes} disabled={isCheckingRecipes || !mealIdeas.length || !recipeSources.length}>
                 {isCheckingRecipes ? <LoaderCircle className="spin" size={18} /> : <Search size={18} />}
                 <span>{isCheckingRecipes ? "Checking sites" : "Check recipe sites"}</span>
               </button>
               {recipeError && <p className="store-error" role="alert">{recipeError}</p>}
+              {recipeNotice && <p className="recipe-notice" role="status">{recipeNotice}</p>}
             </div>
 
             <div className="recipe-check-results" aria-live="polite">
@@ -691,7 +1056,7 @@ export default function App() {
                                     {importingRecipe === `${source.source}-${recipe.id || recipe.url}`
                                       ? <LoaderCircle className="spin" size={14} />
                                       : <Plus size={14} />}
-                                    <span>Add ingredients</span>
+                                    <span>Replace list</span>
                                   </button>
                                 </li>
                               ))}
@@ -710,8 +1075,8 @@ export default function App() {
             </div>
           </div>
         </section>
-          </>
-        ) : (
+          </div>
+        ) : activeTab === "recipes" ? (
           <section className="saved-recipes-view" id="saved-recipes-view" role="tabpanel" aria-labelledby="saved-recipes-tab">
             <div className="saved-recipes-heading">
               <div>
@@ -731,7 +1096,14 @@ export default function App() {
                     <div className="saved-recipe-topline">
                       <div>
                         <h3>{recipe.title}</h3>
-                        <p>{recipe.source === "themealdb" ? "TheMealDB" : "Budget Bytes"} · {recipe.ingredients.length} ingredients · {recipe.instructions.length} steps</p>
+                        <p>
+                          {[
+                            RECIPE_SOURCE_NAMES[recipe.source] || recipe.source,
+                            recipe.servings ? `Makes ${scaleServings(recipe.servings, recipeScales[recipe.id] || 1)}` : null,
+                            `${recipe.ingredients.length} ingredients`,
+                            `${recipe.instructions.length} steps`,
+                          ].filter(Boolean).join(" · ")}
+                        </p>
                       </div>
                       <button
                         className="icon-button remove-button"
@@ -745,16 +1117,41 @@ export default function App() {
                     </div>
                     <details className="saved-recipe-details">
                       <summary>Open recipe for cooking</summary>
-                      <a className="saved-source-link" href={recipe.url} target="_blank" rel="noreferrer">
-                        View original recipe <ExternalLink size={13} />
-                      </a>
+                      <div className="recipe-toolbar">
+                        <a className="saved-source-link" href={recipe.url} target="_blank" rel="noreferrer">
+                          View original recipe <ExternalLink size={13} />
+                        </a>
+                        <div className="scale-picker" role="group" aria-label={`Scale ${recipe.title}`}>
+                          {SCALE_OPTIONS.map((factor) => (
+                            <button
+                              key={factor}
+                              type="button"
+                              className={(recipeScales[recipe.id] || 1) === factor ? "active" : ""}
+                              aria-pressed={(recipeScales[recipe.id] || 1) === factor}
+                              onClick={() => setRecipeScales((current) => ({ ...current, [recipe.id]: factor }))}
+                            >
+                              {factor}×
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <p className="recipe-servings">
+                        {recipe.servings
+                          ? `Makes ${scaleServings(recipe.servings, recipeScales[recipe.id] || 1)}${(recipeScales[recipe.id] || 1) > 1 ? ` (${recipeScales[recipe.id]}× of ${recipe.servings})` : ""}`
+                          : "Servings not listed by the source."}
+                        {!recipe.servings && recipe.source !== "themealdb" && (
+                          <button type="button" className="text-link-button" disabled={refreshingRecipeId === recipe.id} onClick={() => refreshSavedRecipe(recipe.id)}>
+                            {refreshingRecipeId === recipe.id ? "Loading…" : "Load from source"}
+                          </button>
+                        )}
+                      </p>
                       <div className="saved-recipe-content">
                         <section>
                           <h4>Ingredients</h4>
                           <ul>
                             {recipe.ingredients.map((ingredient, index) => (
                               <li key={`${ingredient.name}-${index}`}>
-                                {ingredient.amount && <strong>{ingredient.amount} </strong>}{ingredient.name}
+                                {ingredient.amount && <strong>{scaleAmount(ingredient.amount, recipeScales[recipe.id] || 1)} </strong>}{ingredient.name}
                               </li>
                             ))}
                           </ul>
@@ -765,7 +1162,20 @@ export default function App() {
                             <ol>
                               {recipe.instructions.map((step, index) => <li key={`${index}-${step}`}>{step}</li>)}
                             </ol>
-                          ) : <p className="source-no-match">No structured instructions are available. Use the original recipe link.</p>}
+                          ) : (
+                            <div className="instructions-missing">
+                              <p className="source-no-match">Instructions weren't saved with this recipe.</p>
+                              <button
+                                type="button"
+                                className="alternative-trigger"
+                                disabled={refreshingRecipeId === recipe.id}
+                                onClick={() => refreshSavedRecipe(recipe.id)}
+                              >
+                                {refreshingRecipeId === recipe.id ? <LoaderCircle className="spin" size={14} /> : <Search size={14} />}
+                                <span>{refreshingRecipeId === recipe.id ? "Loading" : "Load instructions from source"}</span>
+                              </button>
+                            </div>
+                          )}
                         </section>
                       </div>
                     </details>
@@ -780,6 +1190,79 @@ export default function App() {
                 <button className="recipe-search-button" type="button" onClick={() => setActiveTab("shopping")}>Find recipes</button>
               </div>
             )}
+          </section>
+        ) : activeTab === "plan" ? (
+          <MealPlan
+            savedRecipes={savedRecipes}
+            isLoadingSavedRecipes={isLoadingSavedRecipes}
+            selectedStore={selectedStore}
+          />
+        ) : activeTab === "enhancements" ? (
+          <section className="enhancements-view" id="enhancements-view" role="tabpanel" aria-labelledby="enhancements-tab">
+            <div className="enhancements-heading">
+              <div>
+                <p className="panel-kicker">ON THE ROADMAP</p>
+                <h2>Future enhancements</h2>
+              </div>
+              <span className="item-count">{String(FUTURE_ENHANCEMENTS.length).padStart(2, "0")}</span>
+            </div>
+            <ol className="enhancements-list">
+              {FUTURE_ENHANCEMENTS.map((enhancement, index) => (
+                <li className="enhancement-row" key={enhancement.title}>
+                  <span className="ingredient-index">{String(index + 1).padStart(2, "0")}</span>
+                  <div>
+                    <h3>{enhancement.title}</h3>
+                    <p>{enhancement.description}</p>
+                  </div>
+                  <span className="enhancement-status">PLANNED</span>
+                </li>
+              ))}
+            </ol>
+          </section>
+        ) : (
+          <section className="settings-view" id="settings-view" role="tabpanel" aria-labelledby="settings-tab">
+            <div className="settings-heading">
+              <div>
+                <p className="panel-kicker">SECURE CONNECTION</p>
+                <h2>Kroger API credentials</h2>
+              </div>
+              <span className={krogerConfigured ? "credential-status configured" : "credential-status"}>
+                {krogerConfigured === null ? "CHECKING" : krogerConfigured ? "CONFIGURED" : "NOT SET"}
+              </span>
+            </div>
+            <p className="settings-description">
+              Credentials are encrypted in the local database. The encryption key is stored separately in this device’s operating-system credential vault. Secrets are never shown again after saving.
+            </p>
+            <form className="credential-form" onSubmit={saveKrogerSettings}>
+              <label htmlFor="kroger-client-id">Client ID</label>
+              <input
+                id="kroger-client-id"
+                autoComplete="off"
+                value={krogerClientId}
+                onChange={(event) => setKrogerClientId(event.target.value)}
+                required
+              />
+              <label htmlFor="kroger-client-secret">Client secret</label>
+              <input
+                id="kroger-client-secret"
+                type="password"
+                autoComplete="new-password"
+                value={krogerClientSecret}
+                onChange={(event) => setKrogerClientSecret(event.target.value)}
+                required
+              />
+              <div className="credential-actions">
+                <button className="recipe-search-button" type="submit" disabled={isSavingKrogerSettings || !krogerClientId.trim() || !krogerClientSecret}>
+                  {isSavingKrogerSettings ? <LoaderCircle className="spin" size={17} /> : null}
+                  <span>{isSavingKrogerSettings ? "Saving securely" : "Save credentials"}</span>
+                </button>
+                <button className="clear-credentials-button" type="button" onClick={clearKrogerSettings} disabled={isSavingKrogerSettings || !krogerConfigured}>
+                  Clear saved credentials
+                </button>
+              </div>
+            </form>
+            {krogerSettingsError && <p className="store-error" role="alert">{krogerSettingsError}</p>}
+            {krogerSettingsNotice && <p className="recipe-notice" role="status">{krogerSettingsNotice}</p>}
           </section>
         )}
 

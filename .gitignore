@@ -20,7 +20,7 @@ dist/
 npm-debug.log*
 
 # Local recipe database
-/data/recipes.sqlite3*
+/data/*.sqlite3*
 
 # Local editor and operating-system files
 .vscode/

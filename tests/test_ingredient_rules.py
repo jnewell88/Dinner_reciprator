@@ -135,6 +135,21 @@ class IngredientParserTests(unittest.TestCase):
         for name in ("taco seasoning", "seasoned salt"):
             self.assertFalse(api.is_generic_pantry_seasoning(name), name)
 
+    def test_pantry_staples(self):
+        for name in ("crushed red pepper flakes", "baking soda", "apple cider vinegar", "soy sauce",
+                     "grated fresh ginger", "ground ginger", "vegetable oil", "cooking oil"):
+            self.assertTrue(api.is_generic_pantry_seasoning(name), name)
+
+    def test_noodle_products_not_matched_to_plain_ingredient(self):
+        scallions = {"description": "Green Onions Scallions", "items": [{"price": {"regular": 0.99}, "size": "1 bunch"}]}
+        noodles = {"description": "Scallion Noodles", "items": [{"price": {"regular": 0.50}, "size": "1 ct"}]}
+        ranked = api.rank_products([noodles, scallions], "scallions, thinly sliced", "2", api.ProductFilters())
+        self.assertIs(ranked[0], scallions)
+        flakes = {"description": "Crushed Red Pepper Flakes", "items": [{"price": {"regular": 2.0}, "size": "1 oz"}]}
+        shaker = {"description": "Parmesan & Red Pepper Flakes Shaker", "items": [{"price": {"regular": 1.0}, "size": "1 oz"}]}
+        ranked = api.rank_products([shaker, flakes], "crushed red pepper flakes", "1/4 tsp", api.ProductFilters())
+        self.assertIs(ranked[0], flakes)
+
 
 if __name__ == "__main__":
     unittest.main()

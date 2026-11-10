@@ -1,10 +1,77 @@
-import requests
 import base64
-from config import KROGER_BASE_URL
+import time
+from urllib.parse import urlencode
+
+import requests
+
+from config import KROGER_ACCOUNT_SCOPE, KROGER_BASE_URL, KROGER_REDIRECT_URI
 from src.secure_credentials import SecureCredentialError, load_kroger_credentials
 
 class KrogerAuthenticationError(RuntimeError):
     pass
+
+
+class KrogerAccountAuthorizationError(RuntimeError):
+    """The linked shopper account's token was rejected; the user must reconnect."""
+
+
+def _app_credentials() -> tuple[str, str]:
+    credentials = load_kroger_credentials()
+    if credentials is None:
+        raise SecureCredentialError("Kroger credentials are not configured. Add them in Settings.")
+    return credentials
+
+
+def _basic_auth_header(client_id: str, client_secret: str) -> str:
+    return "Basic " + base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+
+
+def account_authorization_url(state: str) -> str:
+    client_id, _ = _app_credentials()
+    query = urlencode({
+        "scope": KROGER_ACCOUNT_SCOPE,
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": KROGER_REDIRECT_URI,
+        "state": state,
+    })
+    return f"{KROGER_BASE_URL}/connect/oauth2/authorize?{query}"
+
+
+def _account_token_request(data: dict) -> dict:
+    client_id, client_secret = _app_credentials()
+    response = requests.post(
+        f"{KROGER_BASE_URL}/connect/oauth2/token",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": _basic_auth_header(client_id, client_secret),
+        },
+        data=data,
+        timeout=20,
+    )
+    if response.status_code in (400, 401, 403):
+        raise KrogerAccountAuthorizationError("Kroger rejected the account authorization. Reconnect your account.")
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("access_token"):
+        raise KrogerAccountAuthorizationError("Kroger did not return an account access token.")
+    return {
+        "access_token": payload["access_token"],
+        "refresh_token": payload.get("refresh_token") or data.get("refresh_token"),
+        "expires_at": time.time() + int(payload.get("expires_in") or 1800),
+    }
+
+
+def exchange_account_code(code: str) -> dict:
+    return _account_token_request({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": KROGER_REDIRECT_URI,
+    })
+
+
+def refresh_account_token(refresh_token: str) -> dict:
+    return _account_token_request({"grant_type": "refresh_token", "refresh_token": refresh_token})
 
 
 class KrogerAPI:
@@ -12,16 +79,12 @@ class KrogerAPI:
         self.access_token = None
 
     def authenticate_client(self, scope: str = "product.compact"):
-        credentials = load_kroger_credentials()
-        if credentials is None:
-            raise SecureCredentialError("Kroger credentials are not configured. Add them in Settings.")
-        client_id, client_secret = credentials
+        client_id, client_secret = _app_credentials()
         auth_url = f"{KROGER_BASE_URL}/connect/oauth2/token"
-        encoded_credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
 
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "Authorization": f"Basic {encoded_credentials}"
+            "Authorization": _basic_auth_header(client_id, client_secret),
         }
         data = {"grant_type": "client_credentials", "scope": scope}
 
@@ -80,14 +143,18 @@ class KrogerAPI:
         response.raise_for_status()
         return response.json().get("data", [])
 
-    def add_items_to_cart(self, user_bearer_token: str, items: list):
-        url = f"{KROGER_BASE_URL}/cart"
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {user_bearer_token}"
-        }
-        payload = {"items": items}
-        response = requests.put(url, headers=headers, json=payload)
+    def add_items_to_cart(self, user_bearer_token: str, items: list[dict]) -> None:
+        """Add items ({upc, quantity, modality}) to the linked shopper's cart."""
+        response = requests.put(
+            f"{KROGER_BASE_URL}/cart/add",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {user_bearer_token}",
+            },
+            json={"items": items},
+            timeout=20,
+        )
+        if response.status_code in (401, 403):
+            raise KrogerAccountAuthorizationError("Kroger rejected the account token. Reconnect your account.")
         response.raise_for_status()
-        return response.status_code == 204

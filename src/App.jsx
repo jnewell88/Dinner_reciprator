@@ -1,14 +1,13 @@
 import { useEffect, useState } from "react";
 import MealPlan from "./MealPlan.jsx";
+import {
+  CartError, DILLONS_CART_URL, addLinesToCart, cartAddedMessage, cartLines, clampQuantity, itemCost, itemQuantity,
+} from "./cart.js";
 import { SCALE_OPTIONS, scaleAmount, scaleServings } from "./scaling.js";
-import { ExternalLink, LoaderCircle, MapPin, Plus, Search, ShoppingBasket, ShoppingCart, Trash2, X } from "lucide-react";
+import { ExternalLink, LoaderCircle, MapPin, Plus, Search, ShoppingBasket, ShoppingCart, Trash2, Undo2, X } from "lucide-react";
 
-const STARTER_INGREDIENTS = [
-  { name: "whole milk", amount: "" },
-  { name: "large eggs", amount: "" },
-  { name: "boneless chicken breast", amount: "" },
-  { name: "rolled oats", amount: "" },
-];
+// The sample list earlier versions started with; a saved list that is exactly this is treated as empty.
+const FORMER_STARTER_INGREDIENTS = ["whole milk", "large eggs", "boneless chicken breast", "rolled oats"];
 
 const FUTURE_ENHANCEMENTS = [
   {
@@ -44,20 +43,25 @@ function formatPrice(price) {
   }).format(Number(price));
 }
 
+const STARTER_STORE = { id: "01400943", name: "Dillons Market" };
+
 export default function App() {
   const [ingredients, setIngredients] = useState(() => {
     try {
       const savedIngredients = JSON.parse(window.localStorage.getItem("shopping-ingredients"));
       if (Array.isArray(savedIngredients)) {
-        return savedIngredients.map((ingredient) => typeof ingredient === "string"
+        const parsed = savedIngredients.map((ingredient) => typeof ingredient === "string"
           ? { name: ingredient, amount: "" }
           : { name: ingredient.name || "", amount: ingredient.amount || "", ...(ingredient.restock ? { restock: true } : {}) })
           .filter((ingredient) => ingredient.name);
+        const isUntouchedSample = parsed.length === FORMER_STARTER_INGREDIENTS.length
+          && parsed.every((ingredient, index) => ingredient.name === FORMER_STARTER_INGREDIENTS[index] && !ingredient.amount);
+        return isUntouchedSample ? [] : parsed;
       }
     } catch {
-      return STARTER_INGREDIENTS;
+      return [];
     }
-    return STARTER_INGREDIENTS;
+    return [];
   });
   const [newIngredient, setNewIngredient] = useState("");
   const [skippedSeasonings, setSkippedSeasonings] = useState(() => {
@@ -75,7 +79,7 @@ export default function App() {
     } catch {
       // Ignore unavailable or malformed browser storage and use the starter store.
     }
-    return { id: "01400943", name: "Dillons Market" };
+    return STARTER_STORE;
   });
   const [zipCode, setZipCode] = useState("");
   const [stores, setStores] = useState(null);
@@ -101,6 +105,15 @@ export default function App() {
   const [isSavingKrogerSettings, setIsSavingKrogerSettings] = useState(false);
   const [krogerSettingsError, setKrogerSettingsError] = useState("");
   const [krogerSettingsNotice, setKrogerSettingsNotice] = useState("");
+  const [accountConnected, setAccountConnected] = useState(null);
+  const [accountRedirectUri, setAccountRedirectUri] = useState("");
+  const [isConnectingAccount, setIsConnectingAccount] = useState(false);
+  const [accountError, setAccountError] = useState("");
+  const [accountNotice, setAccountNotice] = useState("");
+  const [isAddingToCart, setIsAddingToCart] = useState(false);
+  const [cartAdded, setCartAdded] = useState(false);
+  const [cartError, setCartError] = useState("");
+  const [cartNotice, setCartNotice] = useState("");
   const [mealIdeas, setMealIdeas] = useState(() => {
     try {
       const savedMeals = JSON.parse(window.localStorage.getItem("meal-list"));
@@ -187,6 +200,46 @@ export default function App() {
       // Storage unavailable; the list still works for this session.
     }
   }, [skippedSeasonings]);
+
+  useEffect(() => {
+    // Returning from the Kroger sign-in page: restore the matches stashed before leaving.
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("kroger_account");
+    if (outcome) {
+      window.history.replaceState(null, "", window.location.pathname);
+      let returnTab = "settings";
+      try {
+        const stashed = window.sessionStorage.getItem("kroger-connect-stash");
+        window.sessionStorage.removeItem("kroger-connect-stash");
+        if (stashed) {
+          const parsed = JSON.parse(stashed);
+          if (Array.isArray(parsed.results)) setResults(parsed.results);
+          if (typeof parsed.tab === "string") returnTab = parsed.tab;
+        }
+      } catch {
+        // Nothing stashed; the matches can be searched again.
+      }
+      const message = outcome === "connected"
+        ? "Dillons account connected."
+        : outcome === "denied"
+        ? "Dillons sign-in was cancelled."
+        : "Dillons sign-in did not complete. Try connecting again.";
+      if (outcome === "connected") {
+        setAccountNotice(message);
+        setCartNotice(message);
+      } else {
+        setAccountError(message);
+        setCartError(message);
+      }
+      setActiveTab(returnTab);
+    }
+    loadAccountStatus();
+    loadStorePreference();
+  }, []);
+
+  useEffect(() => {
+    setCartAdded(false);
+  }, [results]);
 
   useEffect(() => {
     if (activeTab !== "settings") return undefined;
@@ -289,6 +342,7 @@ export default function App() {
 
   function chooseStore(store) {
     setSelectedStore(store);
+    saveStorePreference(store);
     setStores(null);
     setStoreError("");
     setResults(null);
@@ -390,6 +444,10 @@ export default function App() {
         alternativesError: requestError.message || "Could not reach the product search service.",
       });
     }
+  }
+
+  function setResultRemoved(index, removed) {
+    updateResult(index, { removed });
   }
 
   function chooseAlternative(index, alternative) {
@@ -527,13 +585,121 @@ export default function App() {
     }
   }
 
-  const matchedProductCount = results?.filter((result) => result.product).length ?? 0;
-  const unmatchedProductCount = results ? results.length - matchedProductCount : 0;
+  function saveStorePreference(store) {
+    fetch("/api/preferences/store", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: store.id, name: store.name }),
+    }).catch(() => {
+      // The browser copy still remembers it; the server copy is a convenience.
+    });
+  }
+
+  async function loadStorePreference() {
+    try {
+      const response = await fetch("/api/preferences/store");
+      const data = await response.json();
+      if (!response.ok) return;
+      if (data.store?.id) {
+        setSelectedStore(data.store);
+      } else {
+        // First run with server storage: keep a store this browser already chose.
+        const savedStore = JSON.parse(window.localStorage.getItem("my-store") || "null");
+        if (savedStore?.id && savedStore?.name && savedStore.id !== STARTER_STORE.id) saveStorePreference(savedStore);
+      }
+    } catch {
+      // Keep the browser's saved store.
+    }
+  }
+
+  async function loadAccountStatus() {
+    try {
+      const response = await fetch("/api/kroger/account");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Account status could not be loaded.");
+      setAccountConnected(data.connected);
+      setAccountRedirectUri(data.redirect_uri || "");
+    } catch (requestError) {
+      setAccountConnected(false);
+      setAccountError(requestError.message || "Could not check the Dillons account connection.");
+    }
+  }
+
+  async function connectAccount() {
+    setAccountError("");
+    setAccountNotice("");
+    setCartError("");
+    setIsConnectingAccount(true);
+    try {
+      const response = await fetch("/api/kroger/account/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ return_to: window.location.origin }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Could not start the Dillons sign-in.");
+      try {
+        window.sessionStorage.setItem("kroger-connect-stash", JSON.stringify({ results, tab: activeTab }));
+      } catch {
+        // Storage unavailable; matches will need to be searched again after sign-in.
+      }
+      window.location.assign(data.authorize_url);
+    } catch (requestError) {
+      const message = requestError.message || "Could not start the Dillons sign-in.";
+      if (activeTab === "settings") setAccountError(message);
+      else setCartError(message);
+      setIsConnectingAccount(false);
+    }
+  }
+
+  async function disconnectAccount() {
+    setAccountError("");
+    setAccountNotice("");
+    setIsConnectingAccount(true);
+    try {
+      const response = await fetch("/api/kroger/account", { method: "DELETE" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Could not disconnect the account.");
+      setAccountConnected(data.connected);
+      setAccountNotice("Dillons account disconnected from this app.");
+    } catch (requestError) {
+      setAccountError(requestError.message || "Could not disconnect the account.");
+    } finally {
+      setIsConnectingAccount(false);
+    }
+  }
+
+  function setResultQuantity(index, value) {
+    updateResult(index, { quantity: clampQuantity(value) });
+  }
+
+  async function addToCart() {
+    if (!cartItems.length) return;
+    setCartError("");
+    setCartNotice("");
+    setIsAddingToCart(true);
+    try {
+      const data = await addLinesToCart(cartItems);
+      setCartAdded(true);
+      setCartNotice(cartAddedMessage(data));
+    } catch (requestError) {
+      if (requestError instanceof CartError && requestError.status === 401) setAccountConnected(false);
+      setCartError(requestError.message || "Could not reach the cart service.");
+    } finally {
+      setIsAddingToCart(false);
+    }
+  }
+
+  const removedResultCount = results?.filter((result) => result.removed).length ?? 0;
+  const matchedProductCount = results?.filter((result) => result.product && !result.removed).length ?? 0;
+  const unmatchedProductCount = results ? results.length - removedResultCount - matchedProductCount : 0;
   const estimatedListTotal = results?.reduce((total, result) => {
-    if (!result.product) return total;
-    const itemCost = Number(result.product.estimated_cost ?? result.product.price);
+    if (!result.product || result.removed) return total;
+    const itemCost = Number(itemCost(result));
     return Number.isFinite(itemCost) ? total + itemCost : total;
   }, 0) ?? 0;
+  const cartItems = cartLines(results || []);
+  const matchedWithoutUpc = matchedProductCount - cartItems.length;
 
   return (
     <div className="app-frame">
@@ -827,7 +993,7 @@ export default function App() {
                 <p className="panel-kicker">KROGER <span> / </span> QUANTITY-ADJUSTED ESTIMATES</p>
                 <h2 id="matches-title">Product matches</h2>
               </div>
-              {results && <span className="match-count">{results.filter((result) => result.product).length} FOUND</span>}
+              {results && <span className="match-count">{matchedProductCount} FOUND</span>}
             </div>
 
             {error ? (
@@ -839,7 +1005,21 @@ export default function App() {
               <div className="message-state loading-state"><LoaderCircle className="spin" size={22} /><span>Checking local products</span></div>
             ) : results ? (
               <div className="results-list">
-                {results.map((result, index) => (
+                {results.map((result, index) => result.removed ? (
+                  <article className="result-row removed-row" key={`${result.ingredient}-${index}`}>
+                    <span className="result-index">{String(index + 1).padStart(2, "0")}</span>
+                    <div className="result-copy">
+                      <p className="result-ingredient">{result.ingredient}</p>
+                      <p className="removed-note">
+                        {result.product ? `Removed — ${result.product.description || "product"}` : "Removed from list"}
+                      </p>
+                    </div>
+                    <button type="button" className="alternative-trigger" onClick={() => setResultRemoved(index, false)}>
+                      <Undo2 size={14} />
+                      <span>Undo</span>
+                    </button>
+                  </article>
+                ) : (
                   <article className={`result-row ${result.product ? "" : result.pantry_skipped ? "pantry-skipped" : "no-match"}`} key={`${result.ingredient}-${index}`}>
                     <span className="result-index">{String(index + 1).padStart(2, "0")}</span>
                     <div className="result-copy">
@@ -919,7 +1099,29 @@ export default function App() {
                     </div>
                     <div className="price-cell">
                       <span>EST. COST</span>
-                      <strong className="product-price">{result.product ? formatPrice(result.product.estimated_cost ?? result.product.price) : "—"}</strong>
+                      <strong className="product-price">{result.product ? formatPrice(itemCost(result)) : "—"}</strong>
+                      {result.product?.upc && (
+                        <label className="quantity-field">
+                          <span>QTY</span>
+                          <input
+                            type="number"
+                            min="1"
+                            max="99"
+                            value={itemQuantity(result)}
+                            onChange={(event) => setResultQuantity(index, event.target.value)}
+                            aria-label={`Packages of ${result.ingredient}`}
+                          />
+                        </label>
+                      )}
+                      <button
+                        type="button"
+                        className="remove-result"
+                        aria-label={`Remove ${result.ingredient}`}
+                        title="Remove from cart"
+                        onClick={() => setResultRemoved(index, true)}
+                      >
+                        <X size={14} />
+                      </button>
                     </div>
                   </article>
                 ))}
@@ -939,19 +1141,50 @@ export default function App() {
                   <span>ESTIMATED LIST TOTAL</span>
                   <strong>{matchedProductCount ? formatPrice(estimatedListTotal) : "—"}</strong>
                   <small>
-                    {unmatchedProductCount
-                      ? `${matchedProductCount} matched; ${unmatchedProductCount} unmatched excluded`
-                      : `${matchedProductCount} matched items`}
+                    {[
+                      unmatchedProductCount
+                        ? `${matchedProductCount} matched; ${unmatchedProductCount} unmatched excluded`
+                        : `${matchedProductCount} matched items`,
+                      removedResultCount ? `${removedResultCount} removed` : null,
+                    ].filter(Boolean).join("; ")}
                   </small>
                 </div>
                 <div className="cart-action">
-                  <button className="cart-button" type="button" disabled title="Dillons account linking is not set up yet">
-                    <ShoppingCart size={17} />
-                    <span>Add to cart</span>
-                  </button>
-                  <small>Dillons account not connected</small>
+                  {accountConnected ? (
+                    <button
+                      className="cart-button"
+                      type="button"
+                      onClick={addToCart}
+                      disabled={isAddingToCart || cartAdded || cartItems.length === 0}
+                    >
+                      {isAddingToCart ? <LoaderCircle className="spin" size={17} /> : <ShoppingCart size={17} />}
+                      <span>{isAddingToCart ? "Adding" : cartAdded ? "Added to cart" : `Add ${cartItems.length} to cart`}</span>
+                    </button>
+                  ) : (
+                    <button
+                      className="cart-button"
+                      type="button"
+                      onClick={connectAccount}
+                      disabled={isConnectingAccount || accountConnected === null}
+                    >
+                      {isConnectingAccount ? <LoaderCircle className="spin" size={17} /> : <ShoppingCart size={17} />}
+                      <span>Connect Dillons to add</span>
+                    </button>
+                  )}
+                  <small>
+                    {accountConnected
+                      ? matchedWithoutUpc > 0 ? `${matchedWithoutUpc} without a UPC skipped · pickup` : "Pickup order"
+                      : "Sign in with your Dillons account"}
+                  </small>
                 </div>
               </div>
+            )}
+            {results && results.length > 0 && cartError && <p className="store-error" role="alert">{cartError}</p>}
+            {results && results.length > 0 && cartNotice && (
+              <p className="recipe-notice" role="status">
+                {cartNotice}{" "}
+                {cartAdded && <a href={DILLONS_CART_URL} target="_blank" rel="noreferrer">Open Dillons cart</a>}
+              </p>
             )}
 
             {results && results.length > 0 && (
@@ -1196,6 +1429,12 @@ export default function App() {
             savedRecipes={savedRecipes}
             isLoadingSavedRecipes={isLoadingSavedRecipes}
             selectedStore={selectedStore}
+            accountConnected={accountConnected}
+            isConnectingAccount={isConnectingAccount}
+            onConnectAccount={connectAccount}
+            onAccountRejected={() => setAccountConnected(false)}
+            connectNotice={cartNotice}
+            connectError={cartError}
           />
         ) : activeTab === "enhancements" ? (
           <section className="enhancements-view" id="enhancements-view" role="tabpanel" aria-labelledby="enhancements-tab">
@@ -1263,6 +1502,41 @@ export default function App() {
             </form>
             {krogerSettingsError && <p className="store-error" role="alert">{krogerSettingsError}</p>}
             {krogerSettingsNotice && <p className="recipe-notice" role="status">{krogerSettingsNotice}</p>}
+
+            <div className="settings-heading account-heading">
+              <div>
+                <p className="panel-kicker">SHOPPER ACCOUNT</p>
+                <h2>Dillons account</h2>
+              </div>
+              <span className={accountConnected ? "credential-status configured" : "credential-status"}>
+                {accountConnected === null ? "CHECKING" : accountConnected ? "CONNECTED" : "NOT CONNECTED"}
+              </span>
+            </div>
+            <p className="settings-description">
+              Sign in on Kroger’s own page to let this app add items to your Dillons cart. Your password never passes through this app; the sign-in token is encrypted like the credentials above.
+              {accountRedirectUri && (
+                <> Your Kroger developer app must list this redirect URI: <code className="redirect-uri">{accountRedirectUri}</code></>
+              )}
+            </p>
+            <div className="credential-actions">
+              <button
+                className="recipe-search-button"
+                type="button"
+                onClick={connectAccount}
+                disabled={isConnectingAccount || !krogerConfigured}
+              >
+                {isConnectingAccount ? <LoaderCircle className="spin" size={17} /> : null}
+                <span>{accountConnected ? "Reconnect Dillons account" : "Connect Dillons account"}</span>
+              </button>
+              <button className="clear-credentials-button" type="button" onClick={disconnectAccount} disabled={isConnectingAccount || !accountConnected}>
+                Disconnect
+              </button>
+            </div>
+            {!krogerConfigured && krogerConfigured !== null && (
+              <p className="settings-description">Save the Kroger API credentials first.</p>
+            )}
+            {accountError && <p className="store-error" role="alert">{accountError}</p>}
+            {accountNotice && <p className="recipe-notice" role="status">{accountNotice}</p>}
           </section>
         )}
 

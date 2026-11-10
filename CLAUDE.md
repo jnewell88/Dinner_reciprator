@@ -20,14 +20,15 @@ Vite runs at `http://127.0.0.1:5173/`; it proxies `/api` to FastAPI on port `800
 
 There are uncommitted changes. Inspect `git status` before editing. The original CLI `main.py` was removed because it is not used by the web app. `.gitignore` excludes local environment files, caches, build output, editor settings, and SQLite runtime databases. Preserve these changes.
 
-The React app currently includes shopping-list/product matching, quantity-aware cost estimates, recipe search/import, saved recipes and cooking view, enhancements roadmap, and Kroger credential settings. Product filters include Kroger packaged brands (fresh-produce exemption), organic meat, organic vegetables, and explicit non-GMO claim. Pantry seasonings can be skipped from the shopping list while remaining in the saved recipe. Recipe-imported shopping lists replace the current list. Seasonings skipped at import are kept (with amounts, `excluded_ingredients`) as "+ Add" chips under the list; skipped rows in results offer "I'm out — find it". Either marks the list item `restock: true`, which `/api/search` always searches even when skipping pantry seasonings.
+The React app currently includes shopping-list/product matching, quantity-aware cost estimates, recipe search/import, saved recipes and cooking view, enhancements roadmap, and Kroger credential settings. Product filters include Kroger packaged brands (fresh-produce exemption), organic meat, organic vegetables, and explicit non-GMO claim. Pantry seasonings can be skipped from the shopping list while remaining in the saved recipe. Recipe-imported shopping lists replace the current list. Seasonings skipped at import are kept (with amounts, `excluded_ingredients`) as "+ Add" chips under the list; skipped rows in results offer "I'm out — find it". Either marks the list item `restock: true`, which `/api/search` always searches even when skipping pantry seasonings. Each product-match row has a remove (×) button that marks it `removed` (collapsed with Undo); removed rows are excluded from the match count and estimated total, and are not sent to the cart.
 
 ## Credential Security Design
 
 - Kroger client ID and secret are submitted through the Settings tab to `/api/settings/kroger`.
-- `src/secure_credentials.py` encrypts the credential JSON using Fernet and stores ciphertext in `data/kroger_credentials.sqlite3`.
+- `src/secure_credentials.py` encrypts the credential JSON using Fernet and stores ciphertext in the `encrypted_settings` table of the app database.
 - The Fernet key is kept separately in the operating-system keyring using service `DinnerReciprator` and account `kroger-credentials-encryption-key`.
-- Database directory/file permissions are restricted where supported; `.gitignore` excludes the SQLite database.
+- All app data lives in one SQLite file, `data/app.sqlite3`, owned by `src/database.py` (`database.connect()` creates the schema, migrates, and sets 0700/0600 permissions). Tables: `saved_recipes`, `encrypted_settings`. On first use it moves rows from the legacy `recipes.sqlite3` / `kroger_credentials.sqlite3` files, verifies them, and deletes the old files. `.gitignore` excludes it.
+- Tests redirect `src.database` paths to a temp directory in `tests/__init__.py`; never let tests touch `data/`.
 - `config.py` holds only non-secret constants; `KrogerAPI.authenticate_client()` reads credentials from the secure store.
 - Status API returns only whether credentials are configured. Save API never echoes credentials. Do not add a secret-retrieval endpoint or persist credentials in browser storage/logs.
 - `cryptography` and `keyring` are in `requirements.txt`. The project venv required a direct pip install after the VS Code package installer reported success without changing that interpreter. Check imports in `.venv` if setup seems inconsistent.
@@ -36,12 +37,12 @@ The React app currently includes shopping-list/product matching, quantity-aware 
 
 ## Recipe Storage and Sources
 
-- Saved recipes are persisted in the local `data/recipes.sqlite3` database.
+- Saved recipes are persisted in the `saved_recipes` table of `data/app.sqlite3`.
 - `/api/recipes/import` fetches source recipe details, persists the full recipe, and returns filtered shopping ingredients separately.
 - TheMealDB and Budget Bytes provide structured ingredients and instructions.
 - Allrecipes search works at `/search?q=...`; recipe pages expose Recipe JSON-LD. Imports keep ingredients, instructions, and the canonical source URL (the saved view always links back to the original). `POST /api/recipes/saved/{id}/refresh` re-fetches a saved recipe; the UI offers it as "Load instructions from source" for recipes saved before instructions were kept.
 - The Pioneer Woman: `robots.txt` disallows `/search`, so search runs against a 24-hour in-memory cache of the public content sitemap (`/food-cooking/recipes/a<id>/<slug>/` URLs, titles from slugs). Imports use the page's Recipe JSON-LD (ingredients and instructions, with the source link).
-- Servings come from JSON-LD `recipeYield` (`normalize_recipe_yield()`, stored in the `servings` column, added by migration in `initialize_recipe_database()`); TheMealDB has none. Recipes saved earlier get servings via "Load from source" (refresh endpoint).
+- Servings come from JSON-LD `recipeYield` (`normalize_recipe_yield()`, stored in the `servings` column, added by migration in `src/database.py`); TheMealDB has none. Recipes saved earlier get servings via "Load from source" (refresh endpoint).
 - Scaling (1×/2×/4×): `scale_amount()`/`scale_servings()` in `api.py` and their mirror in `src/scaling.js` (keep in sync). Saved-recipe view scales display only; `/api/plan` takes `recipe_scales` and scales ingredient amounts before merging.
 - `format_recipe_amount()` renders decimal measurements as fractions: approximate common fractions when close, otherwise exact rational fractions.
 
@@ -50,7 +51,16 @@ The React app currently includes shopping-list/product matching, quantity-aware 
 - `src/MealPlan.jsx` + `POST /api/plan`: pick saved recipes (max 14), set tab-specific strict filters (stored in localStorage `plan-filters`), and get a report: matched (cheapest of the closest matches), needs-your-choice (unmatched or removed, with alternatives), and skipped pantry seasonings ("I'm out" searches with `restock`).
 - `plan_items()` merges ingredients across meals by `product_search_term()` and sums amounts with a shared dimension (`combine_plan_amounts()`); searches run 4-way parallel.
 - `ProductFilters.exclude_terms` (whole-word match on description/brand) and `max_package_price` apply everywhere `search_ingredient_products()` is used.
-- Add-to-cart is intentionally disabled: Kroger account linking (OAuth authorization-code flow, `cart.basic:write`, redirect URI registered at developer.kroger.com) is not built yet. Note `KrogerAPI.add_items_to_cart` targets `/cart`; Kroger's endpoint is `PUT /v1/cart/add`.
+- The Meal Plan report has the same cart controls as the Shopping tab: per-item QTY, remove (×) with Undo, and Add to cart. The report is kept in sessionStorage `plan-report` so it survives tab switches and the Dillons sign-in redirect. Shared cart helpers live in `src/cart.js`.
+
+## Dillons Cart (Kroger shopper account)
+
+- OAuth authorization-code flow: `POST /api/kroger/account/connect` (body `return_to`, must be http localhost/127.0.0.1) returns Kroger's authorize URL with a single-use `state` (in-memory, 10-minute TTL). Kroger redirects to `GET /api/kroger/callback`, which exchanges the code and 303-redirects to the app with `?kroger_account=connected|denied|error`.
+- Redirect URI is `KROGER_REDIRECT_URI` in `config.py` (`http://localhost:8000/api/kroger/callback`); it must be registered exactly on the Kroger developer app. Scope `cart.basic:write`.
+- Shopper tokens (access, refresh, expires_at) are Fernet-encrypted in `encrypted_settings` row `kroger_account` (`save/load/clear_kroger_account_tokens`). `GET /api/kroger/account` returns only `connected` and the redirect URI; never return tokens. Changing the client ID or clearing app credentials clears the shopper tokens.
+- `POST /api/cart/add` (`items: [{upc, quantity}]`, modality PICKUP) calls `PUT /v1/cart/add`. `account_access_token()` refreshes ~60s before expiry; a 401/403 from the cart retries once after a forced refresh, then clears tokens and returns 401 ("reconnect").
+- Products carry `quantity` (packages from the cost estimate's "N packs", else 1); the UI has a per-row QTY field and sends only non-removed matches with a UPC. The full-page Kroger sign-in would lose React state, so the UI stashes `results` + tab in sessionStorage `kroger-connect-stash` and restores them on return.
+- The Kroger public cart API can only add items; it cannot read or clear the cart.
 
 ## Product Search Pipeline
 
@@ -75,6 +85,7 @@ Verified 2026-11-08: secure credential save/load/clear against the real Secret S
 
 1. Settings tab UI in a browser has not been exercised (secret input clears after save, status updates). The API behind it is verified.
 2. Block-cheese and alternatives behavior is verified only against a fake catalog. Spot-check with real Kroger credentials whether `"<cheese> block"` queries return good results.
+3. Dillons account linking and cart add are verified only with mocked Kroger responses. First real run: register the redirect URI, connect, and add one item.
 
 ## Style and Safety
 

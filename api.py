@@ -15,43 +15,35 @@ from typing import Any
 from typing import Literal
 from urllib.parse import urljoin, urlparse
 
+import secrets
+from urllib.parse import urlencode
+
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-from src.kroger_client import KrogerAPI, KrogerAuthenticationError
+from config import KROGER_REDIRECT_URI
+from src import database
+from src.kroger_client import (
+    KrogerAccountAuthorizationError,
+    KrogerAPI,
+    KrogerAuthenticationError,
+    account_authorization_url,
+    exchange_account_code,
+    refresh_account_token,
+)
 from src.secure_credentials import (
     SecureCredentialError,
+    clear_kroger_account_tokens,
     clear_kroger_credentials,
+    load_kroger_account_tokens,
     load_kroger_credentials,
+    save_kroger_account_tokens,
     save_kroger_credentials,
 )
 
 app = FastAPI(title="Dinner Reciprator API")
-RECIPE_DATABASE_PATH = Path(__file__).resolve().parent / "data" / "recipes.sqlite3"
-
-
-def initialize_recipe_database() -> None:
-    RECIPE_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(RECIPE_DATABASE_PATH) as connection:
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS saved_recipes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL,
-                source_recipe_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                url TEXT NOT NULL,
-                ingredients_json TEXT NOT NULL,
-                instructions_json TEXT NOT NULL,
-                saved_at TEXT NOT NULL,
-                UNIQUE(source, source_recipe_id)
-            )"""
-        )
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(saved_recipes)")}
-        if "servings" not in columns:
-            connection.execute("ALTER TABLE saved_recipes ADD COLUMN servings TEXT NOT NULL DEFAULT ''")
-
-
 def serialize_saved_recipe(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -66,9 +58,8 @@ def serialize_saved_recipe(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def save_recipe_record(source: str, source_recipe_id: str, recipe: dict[str, Any]) -> dict[str, Any]:
-    initialize_recipe_database()
     saved_at = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(RECIPE_DATABASE_PATH) as connection:
+    with database.connect() as connection:
         connection.row_factory = sqlite3.Row
         connection.execute(
             """INSERT INTO saved_recipes
@@ -567,6 +558,7 @@ ALTERED_PRODUCT_PATTERNS = (
     r"\blight\b", r"dairy[\s-]+free", r"non[\s-]+dairy", r"plant[\s-]+based", r"vegan", r"alternative",
     r"flavou?red", r"seasoned", r"ranch\s+style", r"chili\s+beans", r"sugar[\s-]+free", r"instant", r"\bmix\b", r"\bdip\b", r"\bsoup\b",
     r"\bbroth\b", r"\bbaby\b", r"\bsauce\b", r"\bspray\b", r"\bchips\b", r"\bsnacks?\b",
+    r"\bnoodles?\b", r"\bramen\b", r"\bshaker\b",
 )
 
 
@@ -596,7 +588,12 @@ def product_sort_key(product: dict[str, Any], amount: str, ingredient_name: str)
             egg_carton_preference = 1
     altered = altered_product_penalty(product, f"{ingredient_name} {query}")
     # A product built around another main ingredient (tomatoes in "Tomatoes and Green Chiles") is a different item.
-    extra_ingredients = (product_tokens & MAIN_INGREDIENT_TOKENS) - query_tokens - set(search_tokens(ingredient_name))
+    named_tokens = query_tokens | set(search_tokens(ingredient_name))
+    # Synonyms (scallions -> green onions) name the same ingredient, not an extra one.
+    for source, alternative in ALTERNATIVE_SYNONYMS.items():
+        if re.search(rf"\b{re.escape(source)}\b", query, flags=re.IGNORECASE):
+            named_tokens |= set(search_tokens(alternative))
+    extra_ingredients = (product_tokens & MAIN_INGREDIENT_TOKENS) - named_tokens
     altered += len(extra_ingredients)
     return missing_terms, altered, estimated_cost is None, egg_carton_preference, estimated_cost or 0.0
 
@@ -842,7 +839,14 @@ def serialize_product(product: dict[str, Any], amount: str, name: str) -> dict[s
         "price": product_price(product),
         "estimated_cost": estimated_cost,
         "purchase_note": purchase_note,
+        "quantity": purchase_quantity(purchase_note),
     }
+
+
+def purchase_quantity(purchase_note: str | None) -> int:
+    """Packages to put in the cart: the "N packs" from the cost estimate, else one."""
+    match = re.match(r"^(\d+) packs?\b", purchase_note or "")
+    return max(1, int(match.group(1))) if match else 1
 
 
 def raise_kroger_http_error(error: Exception, action: str) -> None:
@@ -910,8 +914,13 @@ def get_kroger_settings() -> dict[str, bool]:
 
 @app.put("/api/settings/kroger")
 def put_kroger_settings(request: KrogerCredentialsRequest) -> dict[str, bool]:
+    client_id = request.client_id.strip()
     try:
-        save_kroger_credentials(request.client_id.strip(), request.client_secret)
+        previous = load_kroger_credentials()
+        if previous is None or previous[0] != client_id:
+            # Account tokens belong to the old Kroger app; they cannot be refreshed with new credentials.
+            clear_kroger_account_tokens()
+        save_kroger_credentials(client_id, request.client_secret)
     except SecureCredentialError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     return {"configured": True}
@@ -920,10 +929,174 @@ def put_kroger_settings(request: KrogerCredentialsRequest) -> dict[str, bool]:
 @app.delete("/api/settings/kroger")
 def delete_kroger_settings() -> dict[str, bool]:
     try:
+        clear_kroger_account_tokens()
         clear_kroger_credentials()
     except SecureCredentialError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     return {"configured": False}
+
+
+class StorePreference(BaseModel):
+    id: str = Field(min_length=1, max_length=20, pattern=r"^[A-Za-z0-9]+$")
+    name: str = Field(min_length=1, max_length=200)
+
+
+@app.get("/api/preferences/store")
+def get_store_preference() -> dict[str, Any]:
+    with database.connect() as connection:
+        row = connection.execute("SELECT value FROM preferences WHERE name = 'store'").fetchone()
+    if row is None:
+        return {"store": None}
+    try:
+        return {"store": StorePreference(**json.loads(row["value"])).model_dump()}
+    except (ValueError, TypeError):
+        return {"store": None}
+
+
+@app.put("/api/preferences/store")
+def put_store_preference(store: StorePreference) -> dict[str, Any]:
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO preferences(name, value) VALUES('store', ?) "
+            "ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            (json.dumps(store.model_dump()),),
+        )
+    return {"store": store.model_dump()}
+
+
+# --- Linked Dillons/Kroger shopper account (OAuth authorization-code flow) ---
+
+ACCOUNT_STATE_TTL_SECONDS = 600
+ACCOUNT_TOKEN_REFRESH_MARGIN_SECONDS = 60
+LOCAL_APP_HOSTS = {"localhost", "127.0.0.1"}
+_pending_account_states: dict[str, tuple[str, float]] = {}
+_account_lock = threading.Lock()
+
+
+class KrogerAccountConnectRequest(BaseModel):
+    return_to: str = Field(default="http://127.0.0.1:5173/", max_length=200)
+
+
+class CartItem(BaseModel):
+    upc: str = Field(pattern=r"^\d{8,14}$")
+    quantity: int = Field(default=1, ge=1, le=99)
+
+
+class CartAddRequest(BaseModel):
+    items: list[CartItem] = Field(min_length=1, max_length=100)
+    modality: Literal["PICKUP", "DELIVERY"] = "PICKUP"
+
+
+def local_return_url(value: str) -> str:
+    """Only send the browser back to this local app, never to an arbitrary site."""
+    parsed = urlparse(value)
+    if parsed.scheme != "http" or parsed.hostname not in LOCAL_APP_HOSTS:
+        raise HTTPException(status_code=400, detail="The return address must be this local app.")
+    return f"{parsed.scheme}://{parsed.netloc}/"
+
+
+def account_access_token(force_refresh: bool = False) -> str:
+    """Return a valid shopper access token, refreshing it when needed. Raises 401 when not linked."""
+    with _account_lock:
+        tokens = load_kroger_account_tokens()
+        if not tokens or not tokens.get("access_token"):
+            raise HTTPException(status_code=401, detail="Connect your Dillons account in Settings first.")
+        fresh = float(tokens.get("expires_at") or 0) - ACCOUNT_TOKEN_REFRESH_MARGIN_SECONDS > time.time()
+        if fresh and not force_refresh:
+            return tokens["access_token"]
+        if not tokens.get("refresh_token"):
+            clear_kroger_account_tokens()
+            raise HTTPException(status_code=401, detail="Your Dillons sign-in expired. Reconnect it in Settings.")
+        try:
+            tokens = refresh_account_token(tokens["refresh_token"])
+        except KrogerAccountAuthorizationError as error:
+            clear_kroger_account_tokens()
+            raise HTTPException(
+                status_code=401, detail="Your Dillons sign-in expired. Reconnect it in Settings."
+            ) from error
+        save_kroger_account_tokens(tokens)
+        return tokens["access_token"]
+
+
+@app.get("/api/kroger/account")
+def get_kroger_account() -> dict[str, Any]:
+    try:
+        connected = bool(load_kroger_account_tokens())
+    except SecureCredentialError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"connected": connected, "redirect_uri": KROGER_REDIRECT_URI}
+
+
+@app.post("/api/kroger/account/connect")
+def connect_kroger_account(request: KrogerAccountConnectRequest) -> dict[str, str]:
+    return_to = local_return_url(request.return_to)
+    state = secrets.token_urlsafe(24)
+    now = time.time()
+    try:
+        url = account_authorization_url(state)
+    except SecureCredentialError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    with _account_lock:
+        for key, (_, created) in list(_pending_account_states.items()):
+            if now - created > ACCOUNT_STATE_TTL_SECONDS:
+                del _pending_account_states[key]
+        _pending_account_states[state] = (return_to, now)
+    return {"authorize_url": url}
+
+
+@app.get("/api/kroger/callback")
+def kroger_account_callback(state: str = "", code: str = "", error: str = "") -> RedirectResponse:
+    with _account_lock:
+        pending = _pending_account_states.pop(state, None) if state else None
+    if pending is None or time.time() - pending[1] > ACCOUNT_STATE_TTL_SECONDS:
+        raise HTTPException(status_code=400, detail="This sign-in link expired. Start again from Settings.")
+    return_to = pending[0]
+
+    def back(result: str) -> RedirectResponse:
+        return RedirectResponse(f"{return_to}?{urlencode({'kroger_account': result})}", status_code=303)
+
+    if error or not code:
+        return back("denied" if error == "access_denied" else "error")
+    try:
+        tokens = exchange_account_code(code)
+        save_kroger_account_tokens(tokens)
+    except (KrogerAccountAuthorizationError, SecureCredentialError, requests.RequestException):
+        return back("error")
+    return back("connected")
+
+
+@app.delete("/api/kroger/account")
+def disconnect_kroger_account() -> dict[str, bool]:
+    try:
+        clear_kroger_account_tokens()
+    except SecureCredentialError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"connected": False}
+
+
+@app.post("/api/cart/add")
+def add_to_cart(request: CartAddRequest) -> dict[str, int]:
+    items = [
+        {"upc": item.upc, "quantity": item.quantity, "modality": request.modality}
+        for item in request.items
+    ]
+    client = KrogerAPI()
+    try:
+        try:
+            client.add_items_to_cart(account_access_token(), items)
+        except KrogerAccountAuthorizationError:
+            # The token may have been revoked early; refresh once before giving up.
+            client.add_items_to_cart(account_access_token(force_refresh=True), items)
+    except KrogerAccountAuthorizationError as error:
+        clear_kroger_account_tokens()
+        raise HTTPException(
+            status_code=401, detail="Dillons rejected your sign-in. Reconnect your account in Settings."
+        ) from error
+    except SecureCredentialError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except requests.RequestException as error:
+        raise HTTPException(status_code=502, detail="Dillons could not add the items to your cart.") from error
+    return {"added": len(items), "packages": sum(item["quantity"] for item in items)}
 
 
 class RecipeJSONLDParser(HTMLParser):
@@ -1032,8 +1205,12 @@ GENERIC_PANTRY_SEASONING_PATTERNS = (
     r"olive oil",
     r"cooking spray",
     r"extra virgin olive oil",
-    r"red pepper flakes",
-    r"crushed red pepper",
+    r"(?:crushed )?red pepper(?: flakes)?",
+    r"(?:vegetable|canola|neutral|cooking) oil",
+    r"baking (?:soda|powder)",
+    r"(?:apple cider|white|distilled white|rice|red wine|white wine|balsamic) vinegar",
+    r"(?:low sodium |reduced sodium |light |dark )?soy sauce",
+    r"(?:grated |minced |fresh |grated fresh |minced fresh |fresh grated )?ginger(?: root)?",
     r"(?:dried )?(?:oregano|thyme|rosemary|marjoram|sage)",
     r"italian seasoning",
     r"garlic powder",
@@ -1420,8 +1597,7 @@ def import_recipe(request: RecipeImportRequest) -> dict[str, Any]:
 
 @app.get("/api/recipes/saved")
 def list_saved_recipes() -> dict[str, list[dict[str, Any]]]:
-    initialize_recipe_database()
-    with sqlite3.connect(RECIPE_DATABASE_PATH) as connection:
+    with database.connect() as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             "SELECT * FROM saved_recipes ORDER BY saved_at DESC, id DESC"
@@ -1432,8 +1608,7 @@ def list_saved_recipes() -> dict[str, list[dict[str, Any]]]:
 @app.post("/api/recipes/saved/{recipe_id}/refresh")
 def refresh_saved_recipe(recipe_id: int) -> dict[str, Any]:
     """Re-fetch a saved recipe from its source (e.g. to fill in instructions saved before they were kept)."""
-    initialize_recipe_database()
-    with sqlite3.connect(RECIPE_DATABASE_PATH) as connection:
+    with database.connect() as connection:
         row = connection.execute(
             "SELECT source, source_recipe_id FROM saved_recipes WHERE id = ?", (recipe_id,)
         ).fetchone()
@@ -1445,8 +1620,7 @@ def refresh_saved_recipe(recipe_id: int) -> dict[str, Any]:
 
 @app.delete("/api/recipes/saved/{recipe_id}")
 def delete_saved_recipe(recipe_id: int) -> dict[str, bool]:
-    initialize_recipe_database()
-    with sqlite3.connect(RECIPE_DATABASE_PATH) as connection:
+    with database.connect() as connection:
         cursor = connection.execute("DELETE FROM saved_recipes WHERE id = ?", (recipe_id,))
     if cursor.rowcount == 0:
         raise HTTPException(status_code=404, detail="Saved recipe was not found.")
@@ -1594,16 +1768,18 @@ def plan_items(recipes: list[dict[str, Any]], skip_pantry_seasonings: bool) -> t
     return list(grouped.values()), list(skipped.values())
 
 
+def load_saved_recipes(recipe_ids: list[int]) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in recipe_ids)
+    with database.connect() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM saved_recipes WHERE id IN ({placeholders})", recipe_ids
+        ).fetchall()
+    return [serialize_saved_recipe(row) for row in rows]
+
+
 @app.post("/api/plan")
 def build_meal_plan(request: MealPlanRequest) -> dict[str, Any]:
-    initialize_recipe_database()
-    placeholders = ",".join("?" for _ in request.recipe_ids)
-    with sqlite3.connect(RECIPE_DATABASE_PATH) as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            f"SELECT * FROM saved_recipes WHERE id IN ({placeholders})", request.recipe_ids
-        ).fetchall()
-    recipes = [serialize_saved_recipe(row) for row in rows]
+    recipes = load_saved_recipes(request.recipe_ids)
     if not recipes:
         raise HTTPException(status_code=404, detail="None of the selected recipes were found.")
     for recipe in recipes:

@@ -76,9 +76,7 @@ class PlanEndpointTests(unittest.TestCase):
         client = FakeClient(catalog)
         rows = [{"id": r["id"], "title": r["title"], "ingredients": r["ingredients"]} for r in PlanItemTests.recipes]
         with mock.patch.object(api, "KrogerAPI", return_value=client), \
-             mock.patch.object(api, "serialize_saved_recipe", side_effect=lambda row: row), \
-             mock.patch.object(api.sqlite3, "connect") as connect:
-            connect.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = rows
+             mock.patch.object(api, "load_saved_recipes", return_value=rows):
             report = api.build_meal_plan(api.MealPlanRequest(recipe_ids=[1, 2], store_id="S1"))
         self.assertEqual([m["name"] for m in report["matched"]], ["ground beef"])
         self.assertEqual([u["name"] for u in report["unmatched"]], ["onion, diced"])

@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
-import { LoaderCircle, Plus, RefreshCw, Search, ShoppingCart, X } from "lucide-react";
+import { LoaderCircle, Plus, RefreshCw, Search, ShoppingCart, Undo2, X } from "lucide-react";
+import {
+  CartError, DILLONS_CART_URL, addLinesToCart, cartAddedMessage, cartLines, clampQuantity, itemCost, itemQuantity,
+} from "./cart.js";
 import { SCALE_OPTIONS, scaleServings } from "./scaling.js";
 
 const DEFAULT_FILTERS = {
@@ -44,18 +47,50 @@ function formatPrice(price) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(Number(price));
 }
 
-function itemCost(product) {
-  const cost = Number(product?.estimated_cost ?? product?.price);
-  return Number.isFinite(cost) ? cost : 0;
+function readSession(key) {
+  try {
+    return JSON.parse(window.sessionStorage.getItem(key));
+  } catch {
+    return null;
+  }
 }
 
-export default function MealPlan({ savedRecipes, isLoadingSavedRecipes, selectedStore }) {
+function writeSession(key, value) {
+  try {
+    if (value == null) window.sessionStorage.removeItem(key);
+    else window.sessionStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Storage unavailable; the report lasts until the page reloads.
+  }
+}
+
+export default function MealPlan({
+  savedRecipes,
+  isLoadingSavedRecipes,
+  selectedStore,
+  accountConnected,
+  isConnectingAccount,
+  onConnectAccount,
+  onAccountRejected,
+  connectNotice,
+  connectError,
+}) {
   const [selectedIds, setSelectedIds] = useState(() => readStored("plan-recipe-ids", []));
   const [scales, setScales] = useState(() => readStored("plan-recipe-scales", {}));
   const [filters, setFilters] = useState(() => ({ ...DEFAULT_FILTERS, ...readStored("plan-filters", {}) }));
-  const [report, setReport] = useState(null);
+  // Kept for the tab session so it survives tab switches and the Dillons sign-in redirect.
+  const [report, setReport] = useState(() => readSession("plan-report"));
   const [isBuilding, setIsBuilding] = useState(false);
   const [error, setError] = useState("");
+  const [isAddingToCart, setIsAddingToCart] = useState(false);
+  const [cartAdded, setCartAdded] = useState(false);
+  const [cartError, setCartError] = useState("");
+  const [cartNotice, setCartNotice] = useState("");
+
+  useEffect(() => {
+    writeSession("plan-report", report);
+    setCartAdded(false);
+  }, [report]);
 
   useEffect(() => writeStored("plan-recipe-ids", selectedIds), [selectedIds]);
   useEffect(() => writeStored("plan-filters", filters), [filters]);
@@ -167,13 +202,38 @@ export default function MealPlan({ savedRecipes, isLoadingSavedRecipes, selected
 
   function changeMatched(index) {
     setReport((current) => {
-      const { product, chosenByYou, ...item } = current.matched[index];
+      const { product, chosenByYou, quantity, removed, ...item } = current.matched[index];
       return {
         ...current,
         matched: current.matched.filter((_, position) => position !== index),
         attention: [...current.attention, { ...item, reason: `You removed ${product.description || "the match"}` }],
       };
     });
+  }
+
+  function updateMatched(index, changes) {
+    setReport((current) => ({
+      ...current,
+      matched: current.matched.map((item, position) => (position === index ? { ...item, ...changes } : item)),
+    }));
+  }
+
+  async function addPlanToCart() {
+    const lines = cartLines(report.matched);
+    if (!lines.length) return;
+    setCartError("");
+    setCartNotice("");
+    setIsAddingToCart(true);
+    try {
+      const data = await addLinesToCart(lines);
+      setCartAdded(true);
+      setCartNotice(cartAddedMessage(data));
+    } catch (requestError) {
+      if (requestError instanceof CartError && requestError.status === 401) onAccountRejected();
+      setCartError(requestError.message || "Could not reach the cart service.");
+    } finally {
+      setIsAddingToCart(false);
+    }
   }
 
   function dropAttention(index) {
@@ -214,7 +274,16 @@ export default function MealPlan({ savedRecipes, isLoadingSavedRecipes, selected
     }
   }
 
-  const total = report ? report.matched.reduce((sum, item) => sum + itemCost(item.product), 0) : 0;
+  const keptMatched = report ? report.matched.filter((item) => !item.removed) : [];
+  const removedCount = report ? report.matched.length - keptMatched.length : 0;
+  const total = keptMatched.reduce((sum, item) => {
+    const cost = Number(itemCost(item));
+    return Number.isFinite(cost) ? sum + cost : sum;
+  }, 0);
+  const lines = report ? cartLines(report.matched) : [];
+  const withoutUpc = keptMatched.length - lines.length;
+  const shownError = cartError || connectError;
+  const shownNotice = cartNotice || (!cartError && connectNotice);
   const canBuild = chosenIds.length > 0 && chosenIds.length <= 14 && selectedStore.id && !isBuilding;
 
   return (
@@ -324,13 +393,43 @@ export default function MealPlan({ savedRecipes, isLoadingSavedRecipes, selected
                   <small>{report.meals.map((meal) => (meal.servings ? `${meal.title}, makes ${meal.servings}` : meal.title)).join(" · ")}</small>
                 </div>
                 <div className="cart-action">
-                  <button className="cart-button" type="button" disabled title="Kroger account linking is not set up yet">
-                    <ShoppingCart size={17} />
-                    <span>Add {report.matched.length} items to cart</span>
-                  </button>
-                  <small>Cart linking not set up yet</small>
+                  {accountConnected ? (
+                    <button
+                      className="cart-button"
+                      type="button"
+                      onClick={addPlanToCart}
+                      disabled={isAddingToCart || cartAdded || lines.length === 0}
+                    >
+                      {isAddingToCart ? <LoaderCircle className="spin" size={17} /> : <ShoppingCart size={17} />}
+                      <span>{isAddingToCart ? "Adding" : cartAdded ? "Added to cart" : `Add ${lines.length} to cart`}</span>
+                    </button>
+                  ) : (
+                    <button
+                      className="cart-button"
+                      type="button"
+                      onClick={onConnectAccount}
+                      disabled={isConnectingAccount || accountConnected === null}
+                    >
+                      {isConnectingAccount ? <LoaderCircle className="spin" size={17} /> : <ShoppingCart size={17} />}
+                      <span>Connect Dillons to add</span>
+                    </button>
+                  )}
+                  <small>
+                    {[
+                      accountConnected ? "Pickup order" : "Sign in with your Dillons account",
+                      removedCount ? `${removedCount} removed` : null,
+                      accountConnected && withoutUpc > 0 ? `${withoutUpc} without a UPC skipped` : null,
+                    ].filter(Boolean).join(" · ")}
+                  </small>
                 </div>
               </div>
+              {shownError && <p className="store-error" role="alert">{shownError}</p>}
+              {shownNotice && (
+                <p className="recipe-notice" role="status">
+                  {shownNotice}{" "}
+                  {cartAdded && <a href={DILLONS_CART_URL} target="_blank" rel="noreferrer">Open Dillons cart</a>}
+                </p>
+              )}
 
               {report.attention.length > 0 && (
                 <section className="plan-section attention">
@@ -394,9 +493,20 @@ export default function MealPlan({ savedRecipes, isLoadingSavedRecipes, selected
               )}
 
               <section className="plan-section">
-                <h3>Matched <span>{report.matched.length}</span></h3>
+                <h3>Matched <span>{keptMatched.length}</span></h3>
                 <ul>
-                  {report.matched.map((item, index) => (
+                  {report.matched.map((item, index) => item.removed ? (
+                    <li key={`${item.name}-${index}`} className="plan-item-head removed-row">
+                      <div>
+                        <small className="result-ingredient">{item.ingredient}</small>
+                        <small className="removed-note">Removed — {item.product.description}</small>
+                      </div>
+                      <button type="button" className="alternative-trigger" onClick={() => updateMatched(index, { removed: false })}>
+                        <Undo2 size={14} />
+                        <span>Undo</span>
+                      </button>
+                    </li>
+                  ) : (
                     <li key={`${item.name}-${index}`} className="plan-item-head">
                       <div>
                         <small className="result-ingredient">{item.ingredient}</small>
@@ -407,9 +517,25 @@ export default function MealPlan({ savedRecipes, isLoadingSavedRecipes, selected
                         </small>
                       </div>
                       <div className="plan-item-price">
-                        <strong className="product-price">{formatPrice(item.product.estimated_cost ?? item.product.price)}</strong>
+                        <strong className="product-price">{formatPrice(itemCost(item))}</strong>
+                        {item.product.upc && (
+                          <label className="quantity-field">
+                            <span>QTY</span>
+                            <input
+                              type="number"
+                              min="1"
+                              max="99"
+                              value={itemQuantity(item)}
+                              onChange={(event) => updateMatched(index, { quantity: clampQuantity(event.target.value) })}
+                              aria-label={`Packages of ${item.ingredient}`}
+                            />
+                          </label>
+                        )}
                         <button type="button" className="plan-icon-button" title="Choose a different product" aria-label={`Change ${item.name}`} onClick={() => changeMatched(index)}>
                           <RefreshCw size={14} />
+                        </button>
+                        <button type="button" className="plan-icon-button" title="Remove from cart" aria-label={`Remove ${item.name}`} onClick={() => updateMatched(index, { removed: true })}>
+                          <X size={14} />
                         </button>
                       </div>
                     </li>
